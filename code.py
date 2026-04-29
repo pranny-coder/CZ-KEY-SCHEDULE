@@ -1,336 +1,485 @@
-import hashlib
-import os
-import random
-from typing import List, Tuple
-import time
+import hashlib, os, random
+from collections import Counter
+
+# ================== BASIC UTILS ==================
 def H(data: bytes) -> bytes:
     return hashlib.sha256(data).digest()
-
-def FirstBits(data: bytes, nbits: int) -> bytes:
-    nbytes = (nbits + 7) // 8
-    return data[:nbytes]
-
-def BitsToInt(data: bytes) -> int:
-    return int.from_bytes(data, byteorder="big", signed=False)
 
 def XOR(a: bytes, b: bytes) -> bytes:
     return bytes(x ^ y for x, y in zip(a, b))
 
-def split_nibbles(block16: bytes) -> List[int]:
-    # 16 bytes -> 32 nibbles (4-bit values)
-    nibbles = []
-    for byte in block16:
-        nibbles.append((byte >> 4) & 0xF)
-        nibbles.append(byte & 0xF)
-    return nibbles
-
-def join_nibbles(nibbles: List[int]) -> bytes:
-    # 32 nibbles -> 16 bytes
-    out = bytearray(16)
-    for i in range(16):
-        hi = nibbles[2*i] & 0xF
-        lo = nibbles[2*i + 1] & 0xF
-        out[i] = (hi << 4) | lo
-    return bytes(out)
-
-def bytes_to_bits(block16: bytes) -> List[int]:
-    # 16 bytes -> 128 bits (big endian within each byte)
-    bits = []
-    for byte in block16:
-        for k in range(7, -1, -1):
-            bits.append((byte >> k) & 1)
-    return bits
-
-def bits_to_bytes(bits: List[int]) -> bytes:
-    # 128 bits -> 16 bytes
-    out = bytearray(16)
-    for i in range(16):
-        v = 0
-        for k in range(8):
-            v = (v << 1) | (bits[i*8 + k] & 1)
-        out[i] = v
-    return bytes(out)
-
-def hamming_distance(a: bytes, b: bytes) -> int:
-    return sum((x ^ y).bit_count() for x, y in zip(a, b))
-
-SBOX = [0x6, 0x4, 0xC, 0x5,
-        0x0, 0x7, 0x2, 0xE,
-        0x1, 0xF, 0x3, 0xD,
-        0x8, 0xA, 0x9, 0xB]
-
-INV_SBOX = [0] * 16
-for i, v in enumerate(SBOX):
-    INV_SBOX[v] = i
-    
-#K32 moves: (±3,±2) and (±2,±3)
-MOVE_K32 = [
-    (3, 2), (3, -2), (-3, 2), (-3, -2),
-    (2, 3), (2, -3), (-2, 3), (-2, -3)
+# ================== SBOX & ANALYSIS ==================
+SBOX = [
+0xC,0x5,0x6,0xB,
+0x9,0x0,0xA,0xD,
+0x3,0xE,0xF,0x8,
+0x4,0x7,0x1,0x2
 ]
+INV_SBOX = [0]*16
+for i,v in enumerate(SBOX): INV_SBOX[v]=i
 
-# B2 moves: diagonal (±2, ±2)
-MOVE_B2 = [
-    (2, 2), (2, -2), (-2, 2), (-2, -2)
-]
+def analyze_sbox_linearity(sbox):
+    """Calculates the Linear Approximation Table (LAT) bias."""
+    max_bias = 0
+    for a in range(1, 16):  # Input mask
+        for b in range(1, 16):  # Output mask
+            hits = 0
+            for x in range(16):
+                if bin(a & x).count('1') % 2 == bin(b & sbox[x]).count('1') % 2:
+                    hits += 1
+            bias = abs(hits - 8)
+            if bias > max_bias: max_bias = bias
+    return max_bias / 16
 
-def BuildMoveTable(deltas: List[Tuple[int, int]]) -> List[List[int]]:
-    table = [[] for _ in range(64)]
+# ================== CHESS LOGIC ==================
+MOVE_K32 = [(3,2),(3,-2),(-3,2),(-3,-2),(2,3),(2,-3),(-2,3),(-2,-3)]
+MOVE_K31 = [(3,1),(3,-1),(-3,1),(-3,-1),(1,3),(1,-3),(-1,3),(-1,-3)]
+
+def BuildMoveTable(deltas):
+    table=[[] for _ in range(64)]
     for sq in range(64):
-        r, c = divmod(sq, 8)
-        for dr, dc in deltas:
-            nr, nc = r + dr, c + dc
-            if 0 <= nr < 8 and 0 <= nc < 8:
-                table[sq].append(nr * 8 + nc)
+        r,c=divmod(sq,8)
+        for dr,dc in deltas:
+            nr,nc=r+dr,c+dc
+            if 0<=nr<8 and 0<=nc<8: table[sq].append(nr*8+nc)
     return table
 
 TABLE_K32 = BuildMoveTable(MOVE_K32)
-TABLE_B2 = BuildMoveTable(MOVE_B2)
+TABLE_K31 = BuildMoveTable(MOVE_K31)
 
-def GetMoves(step_j: int, current_sq: int, mode: int) -> List[int]:
-    if mode == 0:
-        if step_j % 2 == 1:
-            return TABLE_K32[current_sq]
-        else:
-            return TABLE_B2[current_sq]
-    else:
-        if step_j % 2 == 0:
-            return TABLE_K32[current_sq]
-        else:
-            return TABLE_B2[current_sq]
+# ================== PERMUTATION ==================
+def bytes_to_bits(b):
+    return [(byte>>k)&1 for byte in b for k in range(7,-1,-1)]
 
-def generate_permutations(num: int = 128, seed: bytes = b"PERMUTATIONS_SEED") -> List[List[int]]:
-    perms = []
-    base = list(range(128))
-    for i in range(num):
-        rnd = random.Random(BitsToInt(H(seed + i.to_bytes(4, "big"))))
-        p = base[:]
-        rnd.shuffle(p)
-        perms.append(p)
-    return perms
+def bits_to_bytes(bits):
+    out=bytearray(16)
+    for i in range(16):
+        v=0
+        for k in range(8): v=(v<<1)|bits[i*8+k]
+        out[i]=v
+    return bytes(out)
 
-PERMUTATIONS = generate_permutations(num=256)
+def ApplyPerm(p, s):
+    bits=bytes_to_bits(s)
+    return bits_to_bytes([bits[p[i]] for i in range(128)])
 
-def ApplyPerm(perm: List[int], state16: bytes) -> bytes:
-    bits = bytes_to_bits(state16)
-    out_bits = [0] * 128
-    for out_i in range(128):
-        out_bits[out_i] = bits[perm[out_i]]
-    return bits_to_bytes(out_bits)
-
-def InversePerm(perm: List[int]) -> List[int]:
-    inv = [0] * 128
-    for out_i, in_i in enumerate(perm):
-        inv[in_i] = out_i
+def InversePerm(p):
+    inv=[0]*128
+    for i,v in enumerate(p): inv[v]=i
     return inv
 
-def init(K: bytes, N: bytes, R: int, W: int):
-    seed = H(K + N)
-    start_sq = BitsToInt(seed) % 64
-    T = FirstBits(seed, 128)
+def gen_perms(n=256):
+    perms=[]
+    base=list(range(128))
+    for i in range(n):
+        rnd=random.Random(int.from_bytes(H(b"perm"+i.to_bytes(4,"big")), "big"))
+        p=base[:]; rnd.shuffle(p); perms.append(p)
+    return perms
 
-    ROUND_KEY = [None] * (R + 1)
-    ROUND_PERM = [None] * (R + 1)
+PERMS = gen_perms()
 
-    mode = 0
+# ================== CIPHER ENGINE ==================
+class ChessWalkCipher:
+    def __init__(self, K, N, R=16, W=20):
+        self.R = R
+        self.W = W
+        seed = H(K + N)
+        self.T = seed[:16]
+        self.start_sq = int.from_bytes(seed, "big") % 64
+        self.RK = [None] * (R + 1)
+        self.RP = [None] * (R + 1)
+        self.walk_history = []
+        
+        for r in range(1, R+1):
+            cur = self.start_sq
+            walk = bytearray()
+            for j in range(1, W+1):
+                h1 = H(K+N+r.to_bytes(4,"big")+j.to_bytes(4,"big")+b"piece")
+                h2 = H(K+N+r.to_bytes(4,"big")+j.to_bytes(4,"big")+cur.to_bytes(1,"big")+b"move")
+                moves = TABLE_K32[cur] if int.from_bytes(h1, "big")%2==0 else TABLE_K31[cur]
+                if not moves: moves = list(set(TABLE_K32[cur] + TABLE_K31[cur]))
+                nxt = moves[int.from_bytes(h2, "big") % len(moves)]
+                walk.append(((cur << 3) ^ nxt ^ j) & 0xFF)
+                cur = nxt
+                self.walk_history.append(cur)
+            h = H(K+N+r.to_bytes(4,"big") + bytes(walk))
+            self.RK[r] = h[:16]
+            self.RP[r] = PERMS[int.from_bytes(h, "big") % len(PERMS)]
 
-    for r in range(1, R + 1):
-        if r % 3 == 0:
-            mode ^= 1
+    def encrypt_block(self, P):
+        S = XOR(P, self.T)
+        for r in range(1, self.R + 1):
+            S = XOR(S, self.RK[r])
+            n = []
+            for b in S:
+                n.append(SBOX[(b >> 4) & 0xF])
+                n.append(SBOX[b & 0xF])
+            out = bytearray(16)
+            for i in range(16): out[i] = (n[2*i] << 4) | n[2*i+1]
+            S = ApplyPerm(self.RP[r], bytes(out))
+        return XOR(S, self.T)
 
-        current_sq = start_sq
-        walk_bytes = bytearray()
+    def decrypt_block(self, C):
+        S = XOR(C, self.T)
+        for r in range(self.R, 0, -1):
+            S = ApplyPerm(InversePerm(self.RP[r]), S)
+            n = []
+            for b in S:
+                n.append(INV_SBOX[(b >> 4) & 0xF])
+                n.append(INV_SBOX[b & 0xF])
+            out = bytearray(16)
+            for i in range(16): out[i] = (n[2*i] << 4) | n[2*i+1]
+            S = XOR(bytes(out), self.RK[r])
+        return XOR(S, self.T)
 
-        for j in range(1, W + 1):
-            h = H(K + N + r.to_bytes(4, "big") + j.to_bytes(4, "big") + T)
-            moves = GetMoves(j, current_sq, mode)
+# ================== TESTS ==================
 
-            if not moves:
-                moves = list(set(TABLE_K32[current_sq] + TABLE_B2[current_sq]))
+def run_chess_heatmap(samples=5000):
+    print("[*] Running Chess-Walk Heatmap Coverage Test...")
 
-            idx = BitsToInt(h) % len(moves)
-            next_sq = moves[idx]
+    coverages=[]
 
-            delta = current_sq ^ next_sq
-            walk_bytes.append(delta & 0xFF)
+    for _ in range(samples):
 
-            current_sq = next_sq
+        K=os.urandom(16)
+        N=os.urandom(16)
 
-        round_hash = H(K + N + r.to_bytes(4, "big") + bytes(walk_bytes))
-        ROUND_KEY[r] = FirstBits(round_hash, 128)
+        cipher=ChessWalkCipher(K,N)
 
-        p_idx = BitsToInt(round_hash) % len(PERMUTATIONS)
-        ROUND_PERM[r] = PERMUTATIONS[p_idx]
+        counts=Counter(cipher.walk_history)
 
-    return T, ROUND_KEY, ROUND_PERM
+        coverages.append(len(counts))
 
-def init_frozen(K: bytes, N: bytes, R: int, W: int):
-    T, ROUND_KEY, ROUND_PERM = init(K, N, R, W)
-    return T, ROUND_KEY, ROUND_PERM
+    mean=sum(coverages)/len(coverages)
 
-def Encrypt(P: bytes, K: bytes, N: bytes, R: int = 10, W: int = 32) -> bytes:
-    assert len(P) == 16
-    T, ROUND_KEY, ROUND_PERM = init(K, N, R, W)
+    var=sum((x-mean)**2 for x in coverages)/len(coverages)
 
-    STATE = XOR(P, T)
+    std=var**0.5
 
-    for r in range(1, R + 1):
-        STATE = XOR(STATE, ROUND_KEY[r])
+    print(f"    Mean Coverage: {mean:.2f}/64")
+    print(f"    Coverage Std Dev: {std:.4f}")
 
-        nibbles = split_nibbles(STATE)
-        nibbles = [SBOX[x] for x in nibbles]
-        STATE = join_nibbles(nibbles)
+def run_integral_test(K, N):
+    print("[*] Running Integral (Saturation) Test...")
+    cipher = ChessWalkCipher(K, N)
+    results = bytearray(16)
+    for i in range(256):
+        P = bytearray(b"constant_prefix_")
+        P[15] = i
+        C = cipher.encrypt_block(bytes(P))
+        for j in range(16): results[j] ^= C[j]
+    zero_count = results.count(0)
+    print(f"    Integral Sum Zero-Bytes: {zero_count}/16")
 
-        STATE = ApplyPerm(ROUND_PERM[r], STATE)
+def run_sbox_analysis():
+    bias = analyze_sbox_linearity(SBOX)
+    print(f"[*] S-Box Linear Bias: {bias:.4f} (Ideal: < 0.2500)")
 
-    C = XOR(STATE, T)
-    return C
+def run_sac_test(K,N,samples=5000):
+    print("[*] Running Strict Avalanche Criterion (SAC)...")
 
-def Decrypt(C: bytes, K: bytes, N: bytes, R: int = 10, W: int = 32) -> bytes:
-    assert len(C) == 16
-    T, ROUND_KEY, ROUND_PERM = init(K, N, R, W)
+    cipher=ChessWalkCipher(K,N)
 
-    STATE = XOR(C,T)
+    grand_total=0
+    total_trials=0
 
-    for r in range(R, 0, -1):
-        invp = InversePerm(ROUND_PERM[r])
-        STATE = ApplyPerm(invp, STATE)
+    for _ in range(samples):
 
-        nibbles = split_nibbles(STATE)
-        nibbles = [INV_SBOX[x] for x in nibbles]
-        STATE = join_nibbles(nibbles)
+        P=os.urandom(16)
 
-        STATE = XOR(STATE, ROUND_KEY[r])
-
-    P = XOR(STATE,T)
-    return P
-
-def EncryptKRounds(P: bytes, K: bytes, N: bytes, k: int, R: int = 10, W: int = 32) -> bytes:
-    assert 1 <= k <= R
-    T, ROUND_KEY, ROUND_PERM = init(K, N, R, W)
-
-    STATE = XOR(P, T)
-
-    for r in range(1, k + 1):
-        STATE = XOR(STATE, ROUND_KEY[r])
-
-        nibbles = split_nibbles(STATE)
-        nibbles = [SBOX[x] for x in nibbles]
-        STATE = join_nibbles(nibbles)
-
-        STATE = ApplyPerm(ROUND_PERM[r], STATE)
-
-    return STATE
-
-def EncryptKRoundsFrozen(P: bytes, T, ROUND_KEY, ROUND_PERM, k: int):
-    STATE = XOR(P, T)
-
-    for r in range(1, k + 1):
-        STATE = XOR(STATE, ROUND_KEY[r])
-
-        nibbles = split_nibbles(STATE)
-        nibbles = [SBOX[x] for x in nibbles]
-        STATE = join_nibbles(nibbles)
-
-        STATE = ApplyPerm(ROUND_PERM[r], STATE)
-
-    return STATE
-
-def flip_one_random_bit(block16: bytes) -> bytes:
-    b = bytearray(block16)
-    bitpos = random.randrange(128)
-    byte_i = bitpos // 8
-    bit_i = 7 - (bitpos % 8)
-    b[byte_i] ^= (1 << bit_i)
-    return bytes(b)
-
-def compute_full_correlation(C1: bytes, C2: bytes) -> float:
-    bits1 = bytes_to_bits(C1)
-    bits2 = bytes_to_bits(C2)
-
-    n = len(bits1)
-    mean1 = sum(bits1) / n
-    mean2 = sum(bits2) / n
-    numerator = sum((bits1[i] - mean1) * (bits2[i] - mean2) for i in range(n))
-    denominator = (sum((bits1[i] - mean1) ** 2 for i in range(n)) * sum((bits2[i] - mean2) ** 2 for i in range(n))) ** 0.5
-    if denominator == 0:
-        return 0
-    return numerator / denominator
-
-def measure_bic(P: bytes, T: bytes, ROUND_KEY, ROUND_PERM, R: int, trials: int = 100):
-    total_mean_corr = 0
-    total_max_corr = 0
-    total_pairs = 0
-
-    for _ in range(trials):
-        C1 = EncryptKRoundsFrozen(P, T, ROUND_KEY, ROUND_PERM, R)
+        C0=cipher.encrypt_block(P)
 
         for i in range(128):
-            P2 = flip_one_random_bit(P)
-            C2 = EncryptKRoundsFrozen(P2, T, ROUND_KEY, ROUND_PERM, R)
 
-            correlation = compute_full_correlation(C1, C2)
+            P2=bytearray(P)
 
-            total_mean_corr += correlation
-            total_max_corr = max(total_max_corr, correlation)
-            total_pairs += 1
+            byte_index=i//8
+            bit_index=7-(i%8)
 
-    avg_mean_corr = total_mean_corr / total_pairs
-    print(f"\nBIC Results: Mean correlation = {avg_mean_corr:.4f}, Max correlation = {total_max_corr:.4f}")
+            P2[byte_index]^=(1<<bit_index)
 
-def AvalanchePerRound(R: int = 10, trials: int = 200, W: int = 32):
-    K = os.urandom(16)
-    N = os.urandom(16)
+            C1=cipher.encrypt_block(bytes(P2))
 
-    for k in range(1, R + 1):
-        total = 0
-        for _ in range(trials):
-            P = os.urandom(16)
-            C1 = EncryptKRounds(P, K, N, k, R=R, W=W)
+            diff=sum(bin(a^b).count("1")
+                     for a,b in zip(C0,C1))
 
-            P2 = flip_one_random_bit(P)
-            C2 = EncryptKRounds(P2, K, N, k, R=R, W=W)
+            grand_total+=diff
+            total_trials+=1
 
-            total += hamming_distance(C1, C2)
+    avg=grand_total/total_trials
 
-        avg = total / trials
-        print(f"Round {k:2d}: avg flipped bits = {avg:.2f} / 128")
+    print(f"    Sample Size: {samples}")
+    print(f"    Avg Output Bits Flipped: {avg:.2f}/128")
 
-def AvalanchePerRound_PureSPN(R: int = 10, trials: int = 200, W: int = 32):
-    K = os.urandom(16)
-    N = os.urandom(16)
-    T, ROUND_KEY, ROUND_PERM = init_frozen(K, N, R, W)
-    print("\nPure SPN Diffusion (SHA frozen):")
 
-    for k in range(1, R + 1):
-        total = 0
-        for _ in range(trials):
-            P = os.urandom(16)
 
-            C1 = EncryptKRoundsFrozen(P, T, ROUND_KEY, ROUND_PERM, k)
-            P2 = flip_one_random_bit(P)
-            C2 = EncryptKRoundsFrozen(P2, T, ROUND_KEY, ROUND_PERM, k)
+def run_differential_test(K,N,samples=5000):
+    print("[*] Running Differential Test...")
 
-            total += hamming_distance(C1, C2)
+    cipher=ChessWalkCipher(K,N)
 
-        avg = total / trials
-        print(f"Round {k:2d}: avg flipped bits = {avg:.2f} / 128")
+    delta=bytes([1]+[0]*15)
 
+    counts=[]
+
+    for _ in range(samples):
+
+        P=os.urandom(16)
+
+        P2=XOR(P,delta)
+
+        C1=cipher.encrypt_block(P)
+        C2=cipher.encrypt_block(P2)
+
+        diff=sum(bin(a^b).count('1')
+                 for a,b in zip(C1,C2))
+
+        counts.append(diff)
+
+    mean=sum(counts)/len(counts)
+
+    var=sum((x-mean)**2 for x in counts)/len(counts)
+
+    std=var**0.5
+
+    print(f"    Differential Spread Mean: {mean:.2f}")
+    print(f"    Differential Spread Std Dev: {std:.4f}")
+
+def run_cycle_test(samples=5000):
+    print("[*] Running State Cycle-Length Test...")
+
+    no_cycle=0
+
+    for _ in range(samples):
+
+        K=os.urandom(16)
+        N=os.urandom(16)
+
+        cipher=ChessWalkCipher(K,N)
+
+        visited={}
+        cycle_found=False
+
+        for idx,sq in enumerate(cipher.walk_history):
+
+            r=(idx//cipher.W)+1
+            j=(idx%cipher.W)+1
+
+            state=(r,j,sq)
+
+            if state in visited:
+                cycle_found=True
+                break
+
+            visited[state]=idx
+
+        if not cycle_found:
+            no_cycle+=1
+
+    print(f"    No Short Cycles: {no_cycle}/{samples}")
+def run_weak_key_search(trials=5000):
+    print("[*] Running Key Avalanche Distribution Test...")
+
+    avalanche_vals=[]
+
+    weak=0
+
+    for _ in range(trials):
+
+        K=os.urandom(16)
+        N=os.urandom(16)
+
+        cipher=ChessWalkCipher(K,N)
+
+        P=b"1234567890ABCDEF"
+
+        C1=cipher.encrypt_block(P)
+
+        P2=bytearray(P)
+        P2[0]^=1
+
+        C2=cipher.encrypt_block(bytes(P2))
+
+        diff=sum(bin(a^b).count('1')
+                 for a,b in zip(C1,C2))
+
+        avalanche_vals.append(diff)
+
+        if diff<50:
+            weak+=1
+
+    mean=sum(avalanche_vals)/len(avalanche_vals)
+
+    var=sum((x-mean)**2
+            for x in avalanche_vals)/len(avalanche_vals)
+
+    std=var**0.5
+
+    print(f"    Mean Avalanche Across Keys: {mean:.2f}")
+    print(f"    Avalanche Std Dev: {std:.4f}")
+    print(f"    Keys Below Threshold(50): {weak}/{trials}")
+
+def run_decrypt_test(K,N,samples=5000):
+    print("[*] Running Decryption Correctness Test...")
+
+    cipher=ChessWalkCipher(K,N)
+
+    correct=0
+
+    for _ in range(samples):
+
+        P=os.urandom(16)
+
+        C=cipher.encrypt_block(P)
+
+        if cipher.decrypt_block(C)==P:
+            correct+=1
+
+    print(f"    Sample Size: {samples}")
+    print(
+      f"    Correct Decryptions:"
+      f" {correct}/{samples}"
+    )   
+
+def run_randomness_tests(K,N):
+    print("[*] Running Randomness Tests...")
+
+    cipher=ChessWalkCipher(K,N)
+
+    bits=[]
+
+    for _ in range(5000):
+
+        P=os.urandom(16)
+
+        C=cipher.encrypt_block(P)
+
+        for byte in C:
+            for k in range(8):
+
+                bits.append(
+                  (byte>>(7-k))&1
+                )
+
+    ones=sum(bits)
+
+    zeros=len(bits)-ones
+
+    p=ones/len(bits)
+
+    print(f"    Frequency: 1s={ones} 0s={zeros}")
+    print(f"    Bit Probability P(1): {p:.6f}")
+
+    runs=1
+
+    for i in range(1,len(bits)):
+        if bits[i]!=bits[i-1]:
+            runs+=1
+
+    print(f"    Runs Count: {runs}") 
+
+def run_differential_trail_search():
+    print("[*] Running Differential Trail Search...")
+    ddt=[[0]*16 for _ in range(16)]
+    for dx in range(16):
+        for x in range(16):
+            dy=SBOX[x]^SBOX[x^dx]
+            ddt[dx][dy]+=1
+    max_prob=0
+    for dx in range(1,16):
+        prob=max(ddt[dx])/16
+        if prob>max_prob: max_prob=prob
+    print(f"    Max Single-SBox Differential Probability: {max_prob:.4f}")
+
+def run_linear_hull_analysis():
+    print("[*] Running Linear Hull Analysis...")
+    max_bias=0
+    for a in range(1,16):
+        for b in range(1,16):
+            hits=0
+            for x in range(16):
+                if (bin(a&x).count('1')%2)==(bin(b&SBOX[x]).count('1')%2): hits+=1
+            bias=abs(hits-8)/16
+            if bias>max_bias: max_bias=bias
+    print(f"    Max Linear Hull Bias: {max_bias:.4f}")
+
+def run_algebraic_analysis(rounds=16):
+    print("[*] Running Algebraic Attack Analysis...")
+    degree=min(128, 2**rounds)
+    print(f"    Estimated Algebraic Degree After {rounds} Rounds: {degree}")
+
+def run_roundkey_uniqueness_test(samples=5000):
+    print("[*] Running Round-Key Uniqueness Test...")
+
+    unique_count=0
+
+    for _ in range(samples):
+
+        K=os.urandom(16)
+        N=os.urandom(16)
+
+        cipher=ChessWalkCipher(K,N)
+
+        seen=set()
+
+        unique=True
+
+        for r in range(1,cipher.R+1):
+
+            if cipher.RK[r] in seen:
+                unique=False
+                break
+
+            seen.add(cipher.RK[r])
+
+        if unique:
+            unique_count+=1
+
+    print(f"    Unique Key Schedules: {unique_count}/{samples}")
+
+# ================== MAIN ==================
+# ================== MAIN ==================
+# ================== MAIN ==================
 if __name__ == "__main__":
-    K = b"THIS_IS_16_BYTEK"
-    N = b"THIS_IS_16_BYTEN"
-    P = b"hellohellobabyga"
-    print("Plaintext :", P)
-    start = time.perf_counter()
-    C = Encrypt(P, K, N, R=30, W=16)
-    end = time.perf_counter()
-    print("Ciphertext:", C.hex())
-    P2 = Decrypt(C, K, N, R=30, W=16)
-    print(f"\nTotal time taken: {end - start:.6f} seconds")
-    print("Decrypted :", P2)
-    T, ROUND_KEY, ROUND_PERM = init_frozen(K, N, R=30, W=32)
-    print("\nAvalanche Test:")
-    AvalanchePerRound(R=30, trials=100, W=32)
-    AvalanchePerRound_PureSPN(R=30, trials=100, W=32)
-    measure_bic(P, T, ROUND_KEY, ROUND_PERM, R=30, trials=100)
+
+    K=b"MY_SECRET_KEY_16"
+    N=b"MY_NONCE_VALUE_1"
+
+    print("\n--- CHESS-WALK CIPHER ADVANCED REPORT ---")
+
+    # =========================
+    # KEY-SCHEDULE / STRUCTURAL
+    # =========================
+    print("\n[KEY-SCHEDULE / STRUCTURAL TESTS]")
+
+    run_chess_heatmap()
+    run_cycle_test()
+    run_weak_key_search()
+    run_roundkey_uniqueness_test()
+
+    # =========================
+    # DIFFUSION / STATISTICAL
+    # =========================
+    print("\n[DIFFUSION / STATISTICAL TESTS]")
+
+   
+    
+    run_decrypt_test(K,N)
+
+    run_sac_test(K,N)
+   
+    
+    run_differential_test(K,N)
+    run_randomness_tests(K,N)
+
+    # =========================
+    # CRYPTANALYTIC RESISTANCE
+    # =========================
+    print("\n[CRYPTANALYTIC RESISTANCE TESTS]")
+
+    run_sbox_analysis()
+    run_differential_trail_search()
+    run_linear_hull_analysis()
+    run_algebraic_analysis()
+
 
